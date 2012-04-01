@@ -1083,20 +1083,28 @@ static void handle_registers(struct fw_card *card, struct fw_request *request,
 	case CSR_CYCLE_TIME:
 	case CSR_BUS_TIME:
 	case CSR_BUSY_TIMEOUT:
-		if (tcode == TCODE_READ_QUADLET_REQUEST)
-			*data = cpu_to_be32(card->driver->read_csr(card, reg));
-		else if (tcode == TCODE_WRITE_QUADLET_REQUEST)
-			card->driver->write_csr(card, reg, be32_to_cpu(*data));
-		else
+		if (tcode == TCODE_READ_QUADLET_REQUEST) {
+			if (card->driver->read_csr(card, reg, payload) < 0)
+				rcode = RCODE_CONFLICT_ERROR;
+			else
+				cpu_to_be32s(payload);
+		} else if (tcode == TCODE_WRITE_QUADLET_REQUEST) {
+			if (card->driver->write_csr(card, reg,
+						    be32_to_cpu(*data)) < 0)
+				rcode = RCODE_CONFLICT_ERROR;
+		} else {
 			rcode = RCODE_TYPE_ERROR;
+		}
 		break;
 
 	case CSR_RESET_START:
-		if (tcode == TCODE_WRITE_QUADLET_REQUEST)
-			card->driver->write_csr(card, CSR_STATE_CLEAR,
-						CSR_STATE_BIT_ABDICATE);
-		else
+		if (tcode == TCODE_WRITE_QUADLET_REQUEST) {
+			if (card->driver->write_csr(card, CSR_STATE_CLEAR,
+						    CSR_STATE_BIT_ABDICATE) < 0)
+				rcode = RCODE_CONFLICT_ERROR;
+		} else {
 			rcode = RCODE_TYPE_ERROR;
+		}
 		break;
 
 	case CSR_SPLIT_TIMEOUT_HI:

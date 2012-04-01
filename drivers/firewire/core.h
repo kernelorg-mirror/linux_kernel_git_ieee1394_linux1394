@@ -79,8 +79,8 @@ struct fw_card_driver {
 	int (*enable_phys_dma)(struct fw_card *card,
 			       int node_id, int generation);
 
-	u32 (*read_csr)(struct fw_card *card, int csr_offset);
-	void (*write_csr)(struct fw_card *card, int csr_offset, u32 value);
+	int (*read_csr)(struct fw_card *card, int csr_offset, u32 *value);
+	int (*write_csr)(struct fw_card *card, int csr_offset, u32 value);
 
 	struct fw_iso_context *
 	(*allocate_iso_context)(struct fw_card *card,
@@ -97,7 +97,7 @@ struct fw_card_driver {
 			 struct fw_iso_buffer *buffer,
 			 unsigned long payload);
 
-	void (*flush_queue_iso)(struct fw_iso_context *ctx);
+	int (*flush_queue_iso)(struct fw_iso_context *ctx);
 
 	int (*stop_iso)(struct fw_iso_context *ctx);
 };

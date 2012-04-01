@@ -1174,11 +1174,11 @@ static int ioctl_get_cycle_timer2(struct client *client, union ioctl_arg *arg)
 	struct fw_card *card = client->device->card;
 	struct timespec ts = {0, 0};
 	u32 cycle_time;
-	int ret = 0;
+	int ret;
 
 	local_irq_disable();
 
-	cycle_time = card->driver->read_csr(card, CSR_CYCLE_TIME);
+	ret = card->driver->read_csr(card, CSR_CYCLE_TIME, &cycle_time);
 
 	switch (a->clk_id) {
 	case CLOCK_REALTIME:      getnstimeofday(&ts);                   break;

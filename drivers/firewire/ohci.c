@@ -200,6 +200,7 @@ struct fw_ohci {
 	 */
 	spinlock_t lock;
 
+	spinlock_t sclk_domain_reg_lock;
 	struct mutex phy_reg_mutex;
 
 	void *misc_buffer;
@@ -360,7 +361,7 @@ static void log_irqs(struct fw_ohci *ohci, u32 evt)
 		return;
 
 	dev_notice(ohci->card.device,
-	    "IRQ %08x%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n", evt,
+	    "IRQ %08x%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n", evt,
 	    evt & OHCI1394_selfIDComplete	? " selfID"		: "",
 	    evt & OHCI1394_RQPkt		? " AR_req"		: "",
 	    evt & OHCI1394_RSPkt		? " AR_resp"		: "",
@@ -372,7 +373,6 @@ static void log_irqs(struct fw_ohci *ohci, u32 evt)
 	    evt & OHCI1394_cycleTooLong		? " cycleTooLong"	: "",
 	    evt & OHCI1394_cycle64Seconds	? " cycle64Seconds"	: "",
 	    evt & OHCI1394_cycleInconsistent	? " cycleInconsistent"	: "",
-	    evt & OHCI1394_regAccessFail	? " regAccessFail"	: "",
 	    evt & OHCI1394_unrecoverableError	? " unrecoverableError"	: "",
 	    evt & OHCI1394_busReset		? " busReset"		: "",
 	    evt & ~(OHCI1394_selfIDComplete | OHCI1394_RQPkt |
@@ -380,8 +380,7 @@ static void log_irqs(struct fw_ohci *ohci, u32 evt)
 		    OHCI1394_respTxComplete | OHCI1394_isochRx |
 		    OHCI1394_isochTx | OHCI1394_postedWriteErr |
 		    OHCI1394_cycleTooLong | OHCI1394_cycle64Seconds |
-		    OHCI1394_cycleInconsistent |
-		    OHCI1394_regAccessFail | OHCI1394_busReset)
+		    OHCI1394_cycleInconsistent | OHCI1394_busReset)
 						? " ?"			: "");
 }
 
@@ -529,20 +528,96 @@ static inline void log_ar_at_event(struct fw_ohci *ohci, char dir, int speed, u3
 
 #endif /* CONFIG_FIREWIRE_OHCI_DEBUG */
 
-static inline void reg_write(const struct fw_ohci *ohci, int offset, u32 data)
-{
-	writel(data, ohci->registers + offset);
-}
-
 static inline u32 reg_read(const struct fw_ohci *ohci, int offset)
 {
 	return readl(ohci->registers + offset);
+}
+
+static inline void reg_write(const struct fw_ohci *ohci, int offset, u32 data)
+{
+	writel(data, ohci->registers + offset);
 }
 
 static inline void flush_writes(const struct fw_ohci *ohci)
 {
 	/* Do a dummy read to flush writes. */
 	reg_read(ohci, OHCI1394_Version);
+}
+
+/* caller must hold sclk_domain_reg_lock */
+static int check_reg_access_fail(const struct fw_ohci *ohci)
+{
+	u32 reg = reg_read(ohci, OHCI1394_IntEventSet);
+
+	if (!~reg)
+		return -ENODEV; /* Card was ejected. */
+
+	if (reg & OHCI1394_regAccessFail) {
+		reg_write(ohci, OHCI1394_IntEventClear, OHCI1394_regAccessFail);
+		/* Clear the bit before any other reg_write in SCLK domain. */
+		mmiowb();
+		return -EAGAIN;
+	}
+
+	return 0;
+}
+
+static int reg_rw_sclk(struct fw_ohci *ohci, int offset, u32 *data,
+		       bool can_sleep, bool read)
+{
+	unsigned long flags;
+	int i, ret;
+
+	for (i = 0; ; i++) {
+		spin_lock_irqsave(&ohci->sclk_domain_reg_lock, flags);
+		if (read)
+			*data = reg_read(ohci, offset);
+		else
+			reg_write(ohci, offset, *data);
+		ret = check_reg_access_fail(ohci);
+		spin_unlock_irqrestore(&ohci->sclk_domain_reg_lock, flags);
+
+		if (ret != -EAGAIN)
+			return ret;
+		if (i == 20)
+			break;
+		if (can_sleep)
+			msleep(50);
+	}
+	dev_err(ohci->card.device, "SClk is off, cannot %s register 0x%03x\n",
+		read ? "read" : "write", offset);
+
+	return ret;
+}
+
+/* accessors for registers in SCLK domain, for use in atomic contexts */
+
+static int reg_read_sclk(struct fw_ohci *ohci, int offset, u32 *data)
+{
+	return reg_rw_sclk(ohci, offset, data, false, true);
+}
+
+static int reg_write_sclk(struct fw_ohci *ohci, int offset, u32 data)
+{
+	return reg_rw_sclk(ohci, offset, &data, false, false);
+}
+
+static int reg_write_sclk_flush(struct fw_ohci *ohci, int offset, u32 data)
+{
+	/* Just for documentation. reg_rw_sclk() implies flush_write(). */
+	return reg_rw_sclk(ohci, offset, &data, false, false);
+}
+
+/* accessors for registers in SCLK domain, for use in process contexts */
+
+static int reg_read_sclk_wait(struct fw_ohci *ohci, int offset, u32 *data)
+{
+	return reg_rw_sclk(ohci, offset, data, true, true);
+}
+
+static int reg_write_sclk_wait(struct fw_ohci *ohci, int offset, u32 data)
+{
+	return reg_rw_sclk(ohci, offset, &data, true, false);
 }
 
 /*
@@ -554,13 +629,16 @@ static inline void flush_writes(const struct fw_ohci *ohci)
 static int read_phy_reg(struct fw_ohci *ohci, int addr)
 {
 	u32 val;
-	int i;
+	int i, ret;
 
-	reg_write(ohci, OHCI1394_PhyControl, OHCI1394_PhyControl_Read(addr));
+	ret = reg_write_sclk_wait(ohci, OHCI1394_PhyControl,
+				  OHCI1394_PhyControl_Read(addr));
+	if (ret < 0)
+		return ret;
 	for (i = 0; i < 3 + 100; i++) {
-		val = reg_read(ohci, OHCI1394_PhyControl);
-		if (!~val)
-			return -ENODEV; /* Card was ejected. */
+		ret = reg_read_sclk_wait(ohci, OHCI1394_PhyControl, &val);
+		if (ret < 0)
+			return ret;
 
 		if (val & OHCI1394_PhyControl_ReadDone)
 			return OHCI1394_PhyControl_ReadData(val);
@@ -577,16 +655,18 @@ static int read_phy_reg(struct fw_ohci *ohci, int addr)
 	return -EBUSY;
 }
 
-static int write_phy_reg(const struct fw_ohci *ohci, int addr, u32 val)
+static int write_phy_reg(struct fw_ohci *ohci, int addr, u32 val)
 {
-	int i;
+	int i, ret;
 
-	reg_write(ohci, OHCI1394_PhyControl,
-		  OHCI1394_PhyControl_Write(addr, val));
+	ret = reg_write_sclk_wait(ohci, OHCI1394_PhyControl,
+				  OHCI1394_PhyControl_Write(addr, val));
+	if (ret < 0)
+		return ret;
 	for (i = 0; i < 3 + 100; i++) {
-		val = reg_read(ohci, OHCI1394_PhyControl);
-		if (!~val)
-			return -ENODEV; /* Card was ejected. */
+		ret = reg_read_sclk_wait(ohci, OHCI1394_PhyControl, &val);
+		if (ret < 0)
+			return ret;
 
 		if (!(val & OHCI1394_PhyControl_WritePending))
 			return 0;
@@ -1216,13 +1296,22 @@ static struct descriptor *context_get_descriptors(struct context *ctx,
 static void context_run(struct context *ctx, u32 extra)
 {
 	struct fw_ohci *ohci = ctx->ohci;
+	int regs_base = ctx->regs;
 
-	reg_write(ohci, COMMAND_PTR(ctx->regs),
+	reg_write(ohci, COMMAND_PTR(regs_base),
 		  le32_to_cpu(ctx->last->branch_address));
-	reg_write(ohci, CONTROL_CLEAR(ctx->regs), ~0);
-	reg_write(ohci, CONTROL_SET(ctx->regs), CONTEXT_RUN | extra);
+
+	if (regs_base < OHCI1394_IsoRcvContextBase(0)) {
+		reg_write(ohci, CONTROL_CLEAR(regs_base), ~0);
+		reg_write(ohci, CONTROL_SET(regs_base), CONTEXT_RUN | extra);
+		flush_writes(ohci);
+	} else {
+		if (reg_write_sclk(ohci, CONTROL_CLEAR(regs_base), ~0) == 0)
+			reg_write_sclk_flush(ohci, CONTROL_SET(regs_base),
+					     CONTEXT_RUN | extra);
+		/* FIXME handle regAccessFail? */
+	}
 	ctx->running = true;
-	flush_writes(ohci);
 }
 
 static void context_append(struct context *ctx,
@@ -1243,17 +1332,30 @@ static void context_append(struct context *ctx,
 static void context_stop(struct context *ctx)
 {
 	struct fw_ohci *ohci = ctx->ohci;
+	int i, ret, regs_base = ctx->regs;
 	u32 reg;
-	int i;
 
-	reg_write(ohci, CONTROL_CLEAR(ctx->regs), CONTEXT_RUN);
+	if (regs_base < OHCI1394_IsoRcvContextBase(0))
+		reg_write(ohci, CONTROL_CLEAR(regs_base), CONTEXT_RUN);
+	else
+		reg_write_sclk(ohci, CONTROL_CLEAR(regs_base), CONTEXT_RUN);
 	ctx->running = false;
 
 	for (i = 0; i < 1000; i++) {
-		reg = reg_read(ohci, CONTROL_SET(ctx->regs));
+		if (regs_base < OHCI1394_IsoRcvContextBase(0)) {
+			reg = reg_read(ohci, CONTROL_SET(regs_base));
+			if (!~reg)
+				return;
+		} else {
+			ret = reg_read_sclk(ohci, CONTROL_SET(regs_base), &reg);
+			if (ret == -ENODEV)
+				return;
+			if (ret < 0)
+				reg = ~0;
+		}
+
 		if ((reg & CONTEXT_ACTIVE) == 0)
 			return;
-
 		if (i)
 			udelay(10);
 	}
@@ -1531,7 +1633,8 @@ static void handle_local_lock(struct fw_ohci *ohci,
 	struct fw_packet response;
 	int tcode, length, ext_tcode, sel, try;
 	__be32 *payload, lock_old;
-	u32 lock_arg, lock_data;
+	u32 lock_arg, lock_data, reg;
+	unsigned long flags;
 
 	tcode = HEADER_GET_TCODE(packet->header[0]);
 	length = HEADER_GET_DATA_LENGTH(packet->header[3]);
@@ -1551,24 +1654,35 @@ static void handle_local_lock(struct fw_ohci *ohci,
 		goto out;
 	}
 
+	spin_lock_irqsave(&ohci->sclk_domain_reg_lock, flags);
+
 	sel = (csr - CSR_BUS_MANAGER_ID) / 4;
 	reg_write(ohci, OHCI1394_CSRData, lock_data);
 	reg_write(ohci, OHCI1394_CSRCompareData, lock_arg);
 	reg_write(ohci, OHCI1394_CSRControl, sel);
 
-	for (try = 0; try < 20; try++)
-		if (reg_read(ohci, OHCI1394_CSRControl) & 0x80000000) {
-			lock_old = cpu_to_be32(reg_read(ohci,
-							OHCI1394_CSRData));
+	for (try = 0; try < 20; try++) {
+		reg = reg_read(ohci, OHCI1394_CSRControl);
+		if (check_reg_access_fail(ohci))
+			break;
+
+		if (reg & OHCI1394_CSRControl_csrDone) {
+			lock_old = cpu_to_be32(reg_read(ohci, OHCI1394_CSRData));
+			if (check_reg_access_fail(ohci))
+				break;
+
 			fw_fill_response(&response, packet->header,
 					 RCODE_COMPLETE,
 					 &lock_old, sizeof(lock_old));
-			goto out;
+			goto out_unlock;
 		}
+	}
 
 	dev_err(ohci->card.device, "swap not done (CSR lock timeout)\n");
 	fw_fill_response(&response, packet->header, RCODE_BUSY, NULL, 0);
 
+ out_unlock:
+	spin_unlock_irqrestore(&ohci->sclk_domain_reg_lock, flags);
  out:
 	fw_core_handle_response(&ohci->card, &response);
 }
@@ -1639,7 +1753,10 @@ static void detect_dead_context(struct fw_ohci *ohci,
 {
 	u32 ctl;
 
-	ctl = reg_read(ohci, CONTROL_SET(regs));
+	if (regs < OHCI1394_IsoRcvContextBase(0))
+		ctl = reg_read(ohci, CONTROL_SET(regs));
+	else if (reg_read_sclk(ohci, CONTROL_SET(regs), &ctl) < 0)
+		ctl = 0;
 	if (ctl & CONTEXT_DEAD) {
 #ifdef CONFIG_FIREWIRE_OHCI_DEBUG
 		dev_err(ohci->card.device,
@@ -1703,7 +1820,7 @@ static u32 cycle_timer_ticks(u32 cycle_timer)
  * error.  (A PCI read should take at least 20 ticks of the 24.576 MHz timer to
  * execute, so we have enough precision to compute the ratio of the differences.)
  */
-static u32 get_cycle_time(struct fw_ohci *ohci)
+static u32 __get_cycle_time(struct fw_ohci *ohci)
 {
 	u32 c0, c1, c2;
 	u32 t0, t1, t2;
@@ -1733,20 +1850,47 @@ static u32 get_cycle_time(struct fw_ohci *ohci)
 	return c2;
 }
 
+static int get_cycle_time(struct fw_ohci *ohci, u32 *value)
+{
+	unsigned long flags;
+	int i, ret;
+
+	for (i = 0; i < 20; i++) {
+		spin_lock_irqsave(&ohci->sclk_domain_reg_lock, flags);
+		*value = __get_cycle_time(ohci);
+		ret = check_reg_access_fail(ohci);
+		spin_unlock_irqrestore(&ohci->sclk_domain_reg_lock, flags);
+
+		if (ret != -EAGAIN)
+			return ret;
+	}
+	dev_err(ohci->card.device, "SClk is off, cannot read cycle timer\n");
+
+	return ret;
+}
+
 /*
  * This function has to be called at least every 64 seconds.  The bus_time
  * field stores not only the upper 25 bits of the BUS_TIME register but also
  * the most significant bit of the cycle timer in bit 6 so that we can detect
  * changes in this bit.
  */
-static u32 update_bus_time(struct fw_ohci *ohci)
+static int update_bus_time(struct fw_ohci *ohci, u32 *value)
 {
-	u32 cycle_time_seconds = get_cycle_time(ohci) >> 25;
+	u32 cycle_time, cycle_time_seconds;
+	int ret;
 
+	ret = get_cycle_time(ohci, &cycle_time);
+	if (ret < 0)
+		return ret;
+
+	cycle_time_seconds = cycle_time >> 25;
 	if ((ohci->bus_time & 0x40) != (cycle_time_seconds & 0x40))
 		ohci->bus_time += 0x40;
+	if (value)
+		*value = ohci->bus_time | cycle_time_seconds;
 
-	return ohci->bus_time | cycle_time_seconds;
+	return 0;
 }
 
 static int get_status_for_port(struct fw_ohci *ohci, int port_index)
@@ -1794,11 +1938,13 @@ static int get_self_id_pos(struct fw_ohci *ohci, u32 self_id,
  */
 static int find_and_insert_self_id(struct fw_ohci *ohci, int self_id_count)
 {
-	int reg, i, pos, status;
+	int ret, i, pos, status;
 	/* link active 1, speed 3, bridge 0, contender 1, more packets 0 */
-	u32 self_id = 0x8040c800;
+	u32 reg, self_id = 0x8040c800;
 
-	reg = reg_read(ohci, OHCI1394_NodeID);
+	ret = reg_read_sclk_wait(ohci, OHCI1394_NodeID, &reg);
+	if (ret < 0)
+		return ret;
 	if (!(reg & OHCI1394_NodeID_idValid)) {
 		dev_notice(ohci->card.device,
 			   "node ID not valid, new bus reset in progress\n");
@@ -1845,7 +1991,8 @@ static void bus_reset_work(struct work_struct *work)
 	dma_addr_t free_rom_bus = 0;
 	bool is_new_root;
 
-	reg = reg_read(ohci, OHCI1394_NodeID);
+	if (reg_read_sclk_wait(ohci, OHCI1394_NodeID, &reg) < 0)
+		return;
 	if (!(reg & OHCI1394_NodeID_idValid)) {
 		dev_notice(ohci->card.device,
 			   "node ID not valid, new bus reset in progress\n");
@@ -1860,8 +2007,8 @@ static void bus_reset_work(struct work_struct *work)
 
 	is_new_root = (reg & OHCI1394_NodeID_root) != 0;
 	if (!(ohci->is_root && is_new_root))
-		reg_write(ohci, OHCI1394_LinkControlSet,
-			  OHCI1394_LinkControl_cycleMaster);
+		reg_write_sclk_wait(ohci, OHCI1394_LinkControlSet,
+				    OHCI1394_LinkControl_cycleMaster);
 	ohci->is_root = is_new_root;
 
 	reg = reg_read(ohci, OHCI1394_SelfIDCount);
@@ -2003,8 +2150,8 @@ static void bus_reset_work(struct work_struct *work)
 	}
 
 #ifdef CONFIG_FIREWIRE_OHCI_REMOTE_DMA
-	reg_write(ohci, OHCI1394_PhyReqFilterHiSet, ~0);
-	reg_write(ohci, OHCI1394_PhyReqFilterLoSet, ~0);
+	reg_write_sclk(ohci, OHCI1394_PhyReqFilterHiSet, ~0);
+	reg_write_sclk(ohci, OHCI1394_PhyReqFilterLoSet, ~0);
 #endif
 
 	spin_unlock_irqrestore(&ohci->lock, flags);
@@ -2079,10 +2226,6 @@ static irqreturn_t irq_handler(int irq, void *data)
 		}
 	}
 
-	if (unlikely(event & OHCI1394_regAccessFail))
-		dev_err(ohci->card.device,
-			"register access failure - please notify linux1394-devel@lists.sf.net\n");
-
 	if (unlikely(event & OHCI1394_postedWriteErr)) {
 		reg_read(ohci, OHCI1394_PostedWriteAddressHi);
 		reg_read(ohci, OHCI1394_PostedWriteAddressLo);
@@ -2096,8 +2239,8 @@ static irqreturn_t irq_handler(int irq, void *data)
 		if (printk_ratelimit())
 			dev_notice(ohci->card.device,
 				   "isochronous cycle too long\n");
-		reg_write(ohci, OHCI1394_LinkControlSet,
-			  OHCI1394_LinkControl_cycleMaster);
+		reg_write_sclk(ohci, OHCI1394_LinkControlSet,
+			       OHCI1394_LinkControl_cycleMaster);
 	}
 
 	if (unlikely(event & OHCI1394_cycleInconsistent)) {
@@ -2117,7 +2260,7 @@ static irqreturn_t irq_handler(int irq, void *data)
 
 	if (event & OHCI1394_cycle64Seconds) {
 		spin_lock(&ohci->lock);
-		update_bus_time(ohci);
+		update_bus_time(ohci, NULL);
 		spin_unlock(&ohci->lock);
 	} else
 		flush_writes(ohci);
@@ -2232,7 +2375,7 @@ static int ohci_enable(struct fw_card *card,
 {
 	struct fw_ohci *ohci = fw_ohci(card);
 	struct pci_dev *dev = to_pci_dev(card->device);
-	u32 lps, seconds, version, irqs;
+	u32 lps, seconds, version, irqs, reg;
 	int i, ret;
 
 	if (software_reset(ohci)) {
@@ -2263,6 +2406,7 @@ static int ohci_enable(struct fw_card *card,
 		dev_err(card->device, "failed to set Link Power Status\n");
 		return -EIO;
 	}
+	reg_write(ohci, OHCI1394_IntEventClear, OHCI1394_regAccessFail);
 
 	if (ohci->quirks & QUIRK_TI_SLLZ059) {
 		ret = probe_tsb41ba3d(ohci);
@@ -2278,9 +2422,11 @@ static int ohci_enable(struct fw_card *card,
 		  OHCI1394_HCControl_noByteSwapData);
 
 	reg_write(ohci, OHCI1394_SelfIDBuffer, ohci->self_id_bus);
-	reg_write(ohci, OHCI1394_LinkControlSet,
-		  OHCI1394_LinkControl_cycleTimerEnable |
-		  OHCI1394_LinkControl_cycleMaster);
+	ret = reg_write_sclk_wait(ohci, OHCI1394_LinkControlSet,
+				  OHCI1394_LinkControl_cycleTimerEnable |
+				  OHCI1394_LinkControl_cycleMaster);
+	if (ret < 0)
+		return ret;
 
 	reg_write(ohci, OHCI1394_ATRetries,
 		  OHCI1394_MAX_AT_REQ_RETRIES |
@@ -2289,8 +2435,11 @@ static int ohci_enable(struct fw_card *card,
 		  (200 << 16));
 
 	seconds = lower_32_bits(get_seconds());
-	reg_write(ohci, OHCI1394_IsochronousCycleTimer, seconds << 25);
 	ohci->bus_time = seconds & ~0x3f;
+	ret = reg_write_sclk_wait(ohci, OHCI1394_IsochronousCycleTimer,
+				  seconds << 25);
+	if (ret < 0)
+		return ret;
 
 	version = reg_read(ohci, OHCI1394_Version) & 0x00ff00ff;
 	if (version >= OHCI_VERSION_1_1) {
@@ -2300,9 +2449,16 @@ static int ohci_enable(struct fw_card *card,
 	}
 
 	/* Get implemented bits of the priority arbitration request counter. */
-	reg_write(ohci, OHCI1394_FairnessControl, 0x3f);
-	ohci->pri_req_max = reg_read(ohci, OHCI1394_FairnessControl) & 0x3f;
-	reg_write(ohci, OHCI1394_FairnessControl, 0);
+	ret = reg_write_sclk_wait(ohci, OHCI1394_FairnessControl, 0x3f);
+	if (ret < 0)
+		return ret;
+	ret = reg_read_sclk_wait(ohci, OHCI1394_FairnessControl, &reg);
+	if (ret < 0)
+		return ret;
+	ret = reg_write_sclk_wait(ohci, OHCI1394_FairnessControl, 0);
+	if (ret < 0)
+		return ret;
+	ohci->pri_req_max = reg & 0x3f;
 	card->priority_budget_implemented = ohci->pri_req_max != 0;
 
 	reg_write(ohci, OHCI1394_PhyUpperBound, 0x00010000);
@@ -2362,24 +2518,20 @@ static int ohci_enable(struct fw_card *card,
 		  be32_to_cpu(ohci->next_config_rom[2]));
 	reg_write(ohci, OHCI1394_ConfigROMmap, ohci->next_config_rom_bus);
 
-	reg_write(ohci, OHCI1394_AsReqFilterHiSet, 0x80000000);
+	ret = reg_write_sclk_wait(ohci, OHCI1394_AsReqFilterHiSet, 0x80000000);
+	if (ret < 0)
+		goto out;
 
 	if (!(ohci->quirks & QUIRK_NO_MSI))
 		pci_enable_msi(dev);
-	if (request_irq(dev->irq, irq_handler,
-			pci_dev_msi_enabled(dev) ? 0 : IRQF_SHARED,
-			ohci_driver_name, ohci)) {
+	ret = request_irq(dev->irq, irq_handler,
+			  pci_dev_msi_enabled(dev) ? 0 : IRQF_SHARED,
+			  ohci_driver_name, ohci);
+	if (ret < 0) {
 		dev_err(card->device, "failed to allocate interrupt %d\n",
 			dev->irq);
 		pci_disable_msi(dev);
-
-		if (config_rom) {
-			dma_free_coherent(ohci->card.device, CONFIG_ROM_SIZE,
-					  ohci->next_config_rom,
-					  ohci->next_config_rom_bus);
-			ohci->next_config_rom = NULL;
-		}
-		return -EIO;
+		goto out;
 	}
 
 	irqs =	OHCI1394_reqTxComplete | OHCI1394_respTxComplete |
@@ -2387,7 +2539,6 @@ static int ohci_enable(struct fw_card *card,
 		OHCI1394_isochTx | OHCI1394_isochRx |
 		OHCI1394_postedWriteErr |
 		OHCI1394_selfIDComplete |
-		OHCI1394_regAccessFail |
 		OHCI1394_cycle64Seconds |
 		OHCI1394_cycleInconsistent |
 		OHCI1394_unrecoverableError |
@@ -2401,9 +2552,11 @@ static int ohci_enable(struct fw_card *card,
 		  OHCI1394_HCControl_linkEnable |
 		  OHCI1394_HCControl_BIBimageValid);
 
-	reg_write(ohci, OHCI1394_LinkControlSet,
-		  OHCI1394_LinkControl_rcvSelfID |
-		  OHCI1394_LinkControl_rcvPhyPkt);
+	ret = reg_write_sclk_wait(ohci, OHCI1394_LinkControlSet,
+				  OHCI1394_LinkControl_rcvSelfID |
+				  OHCI1394_LinkControl_rcvPhyPkt);
+	if (ret < 0)
+		goto out;
 
 	ar_context_run(&ohci->ar_request_ctx);
 	ar_context_run(&ohci->ar_response_ctx);
@@ -2414,6 +2567,14 @@ static int ohci_enable(struct fw_card *card,
 	fw_schedule_bus_reset(&ohci->card, false, true);
 
 	return 0;
+ out:
+	if (config_rom) {
+		dma_free_coherent(ohci->card.device, CONFIG_ROM_SIZE,
+				  ohci->next_config_rom,
+				  ohci->next_config_rom_bus);
+		ohci->next_config_rom = NULL;
+	}
+	return ret;
 }
 
 static int ohci_set_config_rom(struct fw_card *card,
@@ -2554,7 +2715,7 @@ static int ohci_enable_phys_dma(struct fw_card *card,
 #else
 	struct fw_ohci *ohci = fw_ohci(card);
 	unsigned long flags;
-	int n, ret = 0;
+	int n, ret;
 
 	/*
 	 * FIXME:  Make sure this bitmask is cleared when we clear the busReset
@@ -2575,11 +2736,11 @@ static int ohci_enable_phys_dma(struct fw_card *card,
 
 	n = (node_id & 0xffc0) == LOCAL_BUS ? node_id & 0x3f : 63;
 	if (n < 32)
-		reg_write(ohci, OHCI1394_PhyReqFilterLoSet, 1 << n);
+		ret = reg_write_sclk_flush(ohci, OHCI1394_PhyReqFilterLoSet,
+					   1 << n);
 	else
-		reg_write(ohci, OHCI1394_PhyReqFilterHiSet, 1 << (n - 32));
-
-	flush_writes(ohci);
+		ret = reg_write_sclk_flush(ohci, OHCI1394_PhyReqFilterHiSet,
+					   1 << (n - 32));
  out:
 	spin_unlock_irqrestore(&ohci->lock, flags);
 
@@ -2587,31 +2748,37 @@ static int ohci_enable_phys_dma(struct fw_card *card,
 #endif /* CONFIG_FIREWIRE_OHCI_REMOTE_DMA */
 }
 
-static u32 ohci_read_csr(struct fw_card *card, int csr_offset)
+static int ohci_read_csr(struct fw_card *card, int csr_offset, u32 *value)
 {
 	struct fw_ohci *ohci = fw_ohci(card);
 	unsigned long flags;
-	u32 value;
+	u32 tmp;
+	int ret;
 
 	switch (csr_offset) {
 	case CSR_STATE_CLEAR:
 	case CSR_STATE_SET:
-		if (ohci->is_root &&
-		    (reg_read(ohci, OHCI1394_LinkControlSet) &
-		     OHCI1394_LinkControl_cycleMaster))
-			value = CSR_STATE_BIT_CMSTR;
-		else
-			value = 0;
+		if (ohci->is_root) {
+			ret = reg_read_sclk(ohci, OHCI1394_LinkControlSet, &tmp);
+			*value = tmp & OHCI1394_LinkControl_cycleMaster ?
+				 CSR_STATE_BIT_CMSTR : 0;
+		} else {
+			ret = 0;
+			*value = 0;
+		}
 		if (ohci->csr_state_setclear_abdicate)
-			value |= CSR_STATE_BIT_ABDICATE;
-
-		return value;
+			*value |= CSR_STATE_BIT_ABDICATE;
+		break;
 
 	case CSR_NODE_IDS:
-		return reg_read(ohci, OHCI1394_NodeID) << 16;
+		ret = reg_read_sclk(ohci, OHCI1394_NodeID, &tmp);
+		*value = tmp << 16;
+		ret = 0;
+		break;
 
 	case CSR_CYCLE_TIME:
-		return get_cycle_time(ohci);
+		ret = get_cycle_time(ohci, value);
+		break;
 
 	case CSR_BUS_TIME:
 		/*
@@ -2620,66 +2787,75 @@ static u32 ohci_read_csr(struct fw_card *card, int csr_offset)
 		 * better check here, too, if the bus time needs to be updated.
 		 */
 		spin_lock_irqsave(&ohci->lock, flags);
-		value = update_bus_time(ohci);
+		ret = update_bus_time(ohci, value);
 		spin_unlock_irqrestore(&ohci->lock, flags);
-		return value;
+		break;
 
 	case CSR_BUSY_TIMEOUT:
-		value = reg_read(ohci, OHCI1394_ATRetries);
-		return (value >> 4) & 0x0ffff00f;
+		*value = (reg_read(ohci, OHCI1394_ATRetries) >> 4) & 0x0ffff00f;
+		ret = 0;
+		break;
 
 	case CSR_PRIORITY_BUDGET:
-		return (reg_read(ohci, OHCI1394_FairnessControl) & 0x3f) |
-			(ohci->pri_req_max << 8);
+		ret = reg_read_sclk(ohci, OHCI1394_FairnessControl, &tmp);
+		*value = (tmp & 0x3f) | (ohci->pri_req_max << 8);
+		break;
 
 	default:
 		WARN_ON(1);
-		return 0;
+		ret = -EINVAL;
+		break;
 	}
+
+	return ret;
 }
 
-static void ohci_write_csr(struct fw_card *card, int csr_offset, u32 value)
+static int ohci_write_csr(struct fw_card *card, int csr_offset, u32 value)
 {
 	struct fw_ohci *ohci = fw_ohci(card);
 	unsigned long flags;
+	int ret;
 
 	switch (csr_offset) {
 	case CSR_STATE_CLEAR:
-		if ((value & CSR_STATE_BIT_CMSTR) && ohci->is_root) {
-			reg_write(ohci, OHCI1394_LinkControlClear,
-				  OHCI1394_LinkControl_cycleMaster);
-			flush_writes(ohci);
-		}
-		if (value & CSR_STATE_BIT_ABDICATE)
+		if ((value & CSR_STATE_BIT_CMSTR) && ohci->is_root)
+			ret = reg_write_sclk_flush(ohci,
+					OHCI1394_LinkControlClear,
+					OHCI1394_LinkControl_cycleMaster);
+		else
+			ret = 0;
+		if (value & CSR_STATE_BIT_ABDICATE && ret == 0)
 			ohci->csr_state_setclear_abdicate = false;
 		break;
 
 	case CSR_STATE_SET:
-		if ((value & CSR_STATE_BIT_CMSTR) && ohci->is_root) {
-			reg_write(ohci, OHCI1394_LinkControlSet,
-				  OHCI1394_LinkControl_cycleMaster);
-			flush_writes(ohci);
-		}
-		if (value & CSR_STATE_BIT_ABDICATE)
+		if ((value & CSR_STATE_BIT_CMSTR) && ohci->is_root)
+			ret = reg_write_sclk_flush(ohci,
+					OHCI1394_LinkControlSet,
+					OHCI1394_LinkControl_cycleMaster);
+		else
+			ret = 0;
+		if (value & CSR_STATE_BIT_ABDICATE && ret == 0)
 			ohci->csr_state_setclear_abdicate = true;
 		break;
 
 	case CSR_NODE_IDS:
-		reg_write(ohci, OHCI1394_NodeID, value >> 16);
-		flush_writes(ohci);
+		ret = reg_write_sclk_flush(ohci, OHCI1394_NodeID, value >> 16);
 		break;
 
 	case CSR_CYCLE_TIME:
-		reg_write(ohci, OHCI1394_IsochronousCycleTimer, value);
-		reg_write(ohci, OHCI1394_IntEventSet,
-			  OHCI1394_cycleInconsistent);
-		flush_writes(ohci);
+		ret = reg_write_sclk_flush(ohci,
+				OHCI1394_IsochronousCycleTimer, value);
+		if (ret == 0)
+			reg_write(ohci, OHCI1394_IntEventSet,
+				  OHCI1394_cycleInconsistent);
 		break;
 
 	case CSR_BUS_TIME:
 		spin_lock_irqsave(&ohci->lock, flags);
 		ohci->bus_time = (ohci->bus_time & 0x7f) | (value & ~0x7f);
 		spin_unlock_irqrestore(&ohci->lock, flags);
+		ret = 0;
 		break;
 
 	case CSR_BUSY_TIMEOUT:
@@ -2687,17 +2863,21 @@ static void ohci_write_csr(struct fw_card *card, int csr_offset, u32 value)
 			((value & 0xf) << 8) | ((value & 0x0ffff000) << 4);
 		reg_write(ohci, OHCI1394_ATRetries, value);
 		flush_writes(ohci);
+		ret = 0;
 		break;
 
 	case CSR_PRIORITY_BUDGET:
-		reg_write(ohci, OHCI1394_FairnessControl, value & 0x3f);
-		flush_writes(ohci);
+		ret = reg_write_sclk_flush(ohci, OHCI1394_FairnessControl,
+					   value & 0x3f);
 		break;
 
 	default:
 		WARN_ON(1);
+		ret = -EINVAL;
 		break;
 	}
+
+	return ret;
 }
 
 static void copy_iso_headers(struct iso_context *ctx, void *p)
@@ -2866,16 +3046,23 @@ static int handle_it_packet(struct context *context,
 	return 1;
 }
 
-static void set_multichannel_mask(struct fw_ohci *ohci, u64 channels)
+static int set_multichannel_mask(struct fw_ohci *ohci, u64 channels)
 {
 	u32 hi = channels >> 32, lo = channels;
+	unsigned long flags;
+	int ret;
 
+	spin_lock_irqsave(&ohci->sclk_domain_reg_lock, flags);
 	reg_write(ohci, OHCI1394_IRMultiChanMaskHiClear, ~hi);
 	reg_write(ohci, OHCI1394_IRMultiChanMaskLoClear, ~lo);
 	reg_write(ohci, OHCI1394_IRMultiChanMaskHiSet, hi);
 	reg_write(ohci, OHCI1394_IRMultiChanMaskLoSet, lo);
-	mmiowb();
-	ohci->mc_channels = channels;
+	ret = check_reg_access_fail(ohci);
+	if (ret == 0)
+		ohci->mc_channels = channels;
+	spin_unlock_irqrestore(&ohci->sclk_domain_reg_lock, flags);
+
+	return ret;
 }
 
 static struct fw_iso_context *ohci_allocate_iso_context(struct fw_card *card,
@@ -2949,11 +3136,16 @@ static struct fw_iso_context *ohci_allocate_iso_context(struct fw_card *card,
 	if (ret < 0)
 		goto out_with_header;
 
-	if (type == FW_ISO_CONTEXT_RECEIVE_MULTICHANNEL)
-		set_multichannel_mask(ohci, 0);
+	if (type == FW_ISO_CONTEXT_RECEIVE_MULTICHANNEL) {
+		ret = set_multichannel_mask(ohci, 0);
+		if (ret < 0)
+			goto out_with_context;
+	}
 
 	return &ctx->base;
 
+ out_with_context:
+	context_release(&ctx->context);
  out_with_header:
 	free_page((unsigned long)ctx->header);
  out:
@@ -3404,12 +3596,20 @@ static int ohci_queue_iso(struct fw_iso_context *base,
 	return ret;
 }
 
-static void ohci_flush_queue_iso(struct fw_iso_context *base)
+static int ohci_flush_queue_iso(struct fw_iso_context *base)
 {
 	struct context *ctx =
 			&container_of(base, struct iso_context, base)->context;
+	int ret, regs_base = ctx->regs;
 
-	reg_write(ctx->ohci, CONTROL_SET(ctx->regs), CONTEXT_WAKE);
+	if (regs_base < OHCI1394_IsoRcvContextBase(0)) {
+		ret = 0;
+		reg_write(ctx->ohci, CONTROL_SET(regs_base), CONTEXT_WAKE);
+	} else {
+		ret = reg_write_sclk(ctx->ohci, CONTROL_SET(regs_base),
+				     CONTEXT_WAKE);
+	}
+	return ret;
 }
 
 static const struct fw_card_driver ohci_driver = {
@@ -3497,6 +3697,7 @@ static int __devinit pci_probe(struct pci_dev *dev,
 	pci_set_drvdata(dev, ohci);
 
 	spin_lock_init(&ohci->lock);
+	spin_lock_init(&ohci->sclk_domain_reg_lock);
 	mutex_init(&ohci->phy_reg_mutex);
 
 	INIT_WORK(&ohci->bus_reset_work, bus_reset_work);

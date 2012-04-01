@@ -591,10 +591,7 @@ static void dummy_send_request(struct fw_card *card, struct fw_packet *packet)
 	packet->callback(packet, card, RCODE_CANCELLED);
 }
 
-static void dummy_send_response(struct fw_card *card, struct fw_packet *packet)
-{
-	packet->callback(packet, card, RCODE_CANCELLED);
-}
+#define dummy_send_response dummy_send_request
 
 static int dummy_cancel_packet(struct fw_card *card, struct fw_packet *packet)
 {
@@ -630,8 +627,9 @@ static int dummy_queue_iso(struct fw_iso_context *ctx, struct fw_iso_packet *p,
 	return -ENODEV;
 }
 
-static void dummy_flush_queue_iso(struct fw_iso_context *ctx)
+static int dummy_flush_queue_iso(struct fw_iso_context *ctx)
 {
+	return -ENODEV;
 }
 
 static const struct fw_card_driver dummy_driver_template = {

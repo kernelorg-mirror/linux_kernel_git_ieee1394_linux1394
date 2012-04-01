@@ -186,9 +186,9 @@ int fw_iso_context_queue(struct fw_iso_context *ctx,
 }
 EXPORT_SYMBOL(fw_iso_context_queue);
 
-void fw_iso_context_queue_flush(struct fw_iso_context *ctx)
+int fw_iso_context_queue_flush(struct fw_iso_context *ctx)
 {
-	ctx->card->driver->flush_queue_iso(ctx);
+	return ctx->card->driver->flush_queue_iso(ctx);
 }
 EXPORT_SYMBOL(fw_iso_context_queue_flush);
 
