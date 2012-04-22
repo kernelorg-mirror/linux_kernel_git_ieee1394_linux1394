@@ -325,6 +325,16 @@ static const struct {
 /* This overrides anything that was found in ohci_quirks[]. */
 static int param_quirks;
 module_param_named(quirks, param_quirks, int, 0644);
+
+static int param_cycle_timer_hard_fail = 1;
+module_param_named(cycle_timer_hard_fail, param_cycle_timer_hard_fail, bool, 0644);
+
+static int param_sclk_retries = 20;
+module_param_named(sclk_retries, param_sclk_retries, int, 0644);
+
+static unsigned param_sclk_sleep = 50;
+module_param_named(sclk_sleep, param_sclk_sleep, uint, 0644);
+
 MODULE_PARM_DESC(quirks, "Chip quirks (default = 0"
 	", nonatomic cycle timer = "	__stringify(QUIRK_CYCLE_TIMER)
 	", reset packet generation = "	__stringify(QUIRK_RESET_PACKET)
@@ -579,10 +589,10 @@ static int reg_rw_sclk(struct fw_ohci *ohci, int offset, u32 *data,
 
 		if (ret != -EAGAIN)
 			return ret;
-		if (i == 20)
+		if (i == param_sclk_retries)
 			break;
 		if (can_sleep)
-			msleep(50);
+			msleep(param_sclk_sleep);
 	}
 	dev_err(ohci->card.device, "SClk is off, cannot %s register 0x%03x\n",
 		read ? "read" : "write", offset);
@@ -2422,11 +2432,15 @@ static int ohci_enable(struct fw_card *card,
 		  OHCI1394_HCControl_noByteSwapData);
 
 	reg_write(ohci, OHCI1394_SelfIDBuffer, ohci->self_id_bus);
+
 	ret = reg_write_sclk_wait(ohci, OHCI1394_LinkControlSet,
 				  OHCI1394_LinkControl_cycleTimerEnable |
 				  OHCI1394_LinkControl_cycleMaster);
-	if (ret < 0)
-		return ret;
+	if (ret < 0) {
+		dev_err(card->device, "%s,%s(),%d: reg_write_sclk_wait() failed.\n", __FILE__, __func__, __LINE__);
+		if (param_cycle_timer_hard_fail)
+			return ret;
+	}
 
 	reg_write(ohci, OHCI1394_ATRetries,
 		  OHCI1394_MAX_AT_REQ_RETRIES |
@@ -2438,8 +2452,12 @@ static int ohci_enable(struct fw_card *card,
 	ohci->bus_time = seconds & ~0x3f;
 	ret = reg_write_sclk_wait(ohci, OHCI1394_IsochronousCycleTimer,
 				  seconds << 25);
-	if (ret < 0)
-		return ret;
+
+	if (ret < 0) {
+		dev_err(card->device, "%s,%s(),%d: reg_write_sclk_wait() failed.\n", __FILE__, __func__, __LINE__);
+		if (param_cycle_timer_hard_fail)
+			return ret;
+	}
 
 	version = reg_read(ohci, OHCI1394_Version) & 0x00ff00ff;
 	if (version >= OHCI_VERSION_1_1) {
@@ -2846,9 +2864,12 @@ static int ohci_write_csr(struct fw_card *card, int csr_offset, u32 value)
 	case CSR_CYCLE_TIME:
 		ret = reg_write_sclk_flush(ohci,
 				OHCI1394_IsochronousCycleTimer, value);
-		if (ret == 0)
+
+		if (ret == 0) {
+			dev_err(card->device, "%s,%s(),%d: reg_write_sclk_wait() failed.\n", __FILE__, __func__, __LINE__);
 			reg_write(ohci, OHCI1394_IntEventSet,
 				  OHCI1394_cycleInconsistent);
+		}
 		break;
 
 	case CSR_BUS_TIME:
