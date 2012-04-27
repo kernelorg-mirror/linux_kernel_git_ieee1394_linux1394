@@ -326,7 +326,7 @@ static const struct {
 static int param_quirks;
 module_param_named(quirks, param_quirks, int, 0644);
 
-static int param_cycle_timer_hard_fail = 1;
+static bool param_cycle_timer_hard_fail = true;
 module_param_named(cycle_timer_hard_fail, param_cycle_timer_hard_fail, bool, 0644);
 
 static int param_sclk_retries = 20;
@@ -587,8 +587,14 @@ static int reg_rw_sclk(struct fw_ohci *ohci, int offset, u32 *data,
 		ret = check_reg_access_fail(ohci);
 		spin_unlock_irqrestore(&ohci->sclk_domain_reg_lock, flags);
 
-		if (ret != -EAGAIN)
-			return ret;
+		if (ret != -EAGAIN) {
+			if (i)
+				dev_notice(ohci->card.device,
+					   "reg_rw_sclk took %d %s retries to %s register 0x%03x\n",
+					   i, can_sleep ? "sleeping" : "busy",
+					   read ? "read" : "write", offset);
+			goto out;
+		}
 		if (i == param_sclk_retries)
 			break;
 		if (can_sleep)
@@ -596,6 +602,8 @@ static int reg_rw_sclk(struct fw_ohci *ohci, int offset, u32 *data,
 	}
 	dev_err(ohci->card.device, "SClk is off, cannot %s register 0x%03x\n",
 		read ? "read" : "write", offset);
+ out:
+	dump_stack();
 
 	return ret;
 }
@@ -1641,7 +1649,7 @@ static void handle_local_lock(struct fw_ohci *ohci,
 			      struct fw_packet *packet, u32 csr)
 {
 	struct fw_packet response;
-	int tcode, length, ext_tcode, sel, try;
+	int tcode, length, ext_tcode, sel, try, err;
 	__be32 *payload, lock_old;
 	u32 lock_arg, lock_data, reg;
 	unsigned long flags;
@@ -1673,12 +1681,14 @@ static void handle_local_lock(struct fw_ohci *ohci,
 
 	for (try = 0; try < 20; try++) {
 		reg = reg_read(ohci, OHCI1394_CSRControl);
-		if (check_reg_access_fail(ohci))
+		err = check_reg_access_fail(ohci);
+		if (err)
 			break;
 
 		if (reg & OHCI1394_CSRControl_csrDone) {
 			lock_old = cpu_to_be32(reg_read(ohci, OHCI1394_CSRData));
-			if (check_reg_access_fail(ohci))
+			err = check_reg_access_fail(ohci);
+			if (err)
 				break;
 
 			fw_fill_response(&response, packet->header,
@@ -1687,8 +1697,13 @@ static void handle_local_lock(struct fw_ohci *ohci,
 			goto out_unlock;
 		}
 	}
-
-	dev_err(ohci->card.device, "swap not done (CSR lock timeout)\n");
+	if (err == -EAGAIN) {
+		dev_err(ohci->card.device,
+			"SClk is off, cannot read CSRControl or CSRData\n");
+		dump_stack();
+	} else {
+		dev_err(ohci->card.device, "swap not done (CSR lock timeout)\n");
+	}
 	fw_fill_response(&response, packet->header, RCODE_BUSY, NULL, 0);
 
  out_unlock:
@@ -1875,6 +1890,7 @@ static int get_cycle_time(struct fw_ohci *ohci, u32 *value)
 			return ret;
 	}
 	dev_err(ohci->card.device, "SClk is off, cannot read cycle timer\n");
+	dump_stack();
 
 	return ret;
 }
@@ -3081,6 +3097,11 @@ static int set_multichannel_mask(struct fw_ohci *ohci, u64 channels)
 	ret = check_reg_access_fail(ohci);
 	if (ret == 0)
 		ohci->mc_channels = channels;
+	if (ret == -EAGAIN) {
+		dev_err(ohci->card.device,
+			"SClk is off, cannot write IRMultiChanMask\n");
+		dump_stack();
+	}
 	spin_unlock_irqrestore(&ohci->sclk_domain_reg_lock, flags);
 
 	return ret;
