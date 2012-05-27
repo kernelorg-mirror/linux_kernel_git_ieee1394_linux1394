@@ -6,9 +6,10 @@
 #define OHCI1394_Version                      0x000
 #define OHCI1394_GUID_ROM                     0x004
 #define OHCI1394_ATRetries                    0x008
-#define OHCI1394_CSRData                      0x00C
-#define OHCI1394_CSRCompareData               0x010
-#define OHCI1394_CSRControl                   0x014
+#define OHCI1394_CSRData                      0x00C	/* SCLK domain */
+#define OHCI1394_CSRCompareData               0x010	/* SCLK domain */
+#define OHCI1394_CSRControl                   0x014	/* SCLK domain */
+#define  OHCI1394_CSRControl_csrDone		0x80000000
 #define OHCI1394_ConfigROMhdr                 0x018
 #define OHCI1394_BusID                        0x01C
 #define OHCI1394_BusOptions                   0x020
@@ -31,10 +32,10 @@
 #define OHCI1394_SelfIDBuffer                 0x064
 #define OHCI1394_SelfIDCount                  0x068
 #define  OHCI1394_SelfIDCount_selfIDError	0x80000000
-#define OHCI1394_IRMultiChanMaskHiSet         0x070
-#define OHCI1394_IRMultiChanMaskHiClear       0x074
-#define OHCI1394_IRMultiChanMaskLoSet         0x078
-#define OHCI1394_IRMultiChanMaskLoClear       0x07C
+#define OHCI1394_IRMultiChanMaskHiSet         0x070	/* SCLK domain */
+#define OHCI1394_IRMultiChanMaskHiClear       0x074	/* SCLK domain */
+#define OHCI1394_IRMultiChanMaskLoSet         0x078	/* SCLK domain */
+#define OHCI1394_IRMultiChanMaskLoClear       0x07C	/* SCLK domain */
 #define OHCI1394_IntEventSet                  0x080
 #define OHCI1394_IntEventClear                0x084
 #define OHCI1394_IntMaskSet                   0x088
@@ -50,34 +51,34 @@
 #define OHCI1394_InitialBandwidthAvailable    0x0B0
 #define OHCI1394_InitialChannelsAvailableHi   0x0B4
 #define OHCI1394_InitialChannelsAvailableLo   0x0B8
-#define OHCI1394_FairnessControl              0x0DC
-#define OHCI1394_LinkControlSet               0x0E0
-#define OHCI1394_LinkControlClear             0x0E4
+#define OHCI1394_FairnessControl              0x0DC	/* SCLK domain */
+#define OHCI1394_LinkControlSet               0x0E0	/* SCLK domain */
+#define OHCI1394_LinkControlClear             0x0E4	/* SCLK domain */
 #define   OHCI1394_LinkControl_rcvSelfID	(1 << 9)
 #define   OHCI1394_LinkControl_rcvPhyPkt	(1 << 10)
 #define   OHCI1394_LinkControl_cycleTimerEnable	(1 << 20)
 #define   OHCI1394_LinkControl_cycleMaster	(1 << 21)
 #define   OHCI1394_LinkControl_cycleSource	(1 << 22)
-#define OHCI1394_NodeID                       0x0E8
+#define OHCI1394_NodeID                       0x0E8	/* SCLK domain */
 #define   OHCI1394_NodeID_idValid             0x80000000
 #define   OHCI1394_NodeID_root                0x40000000
 #define   OHCI1394_NodeID_nodeNumber          0x0000003f
 #define   OHCI1394_NodeID_busNumber           0x0000ffc0
-#define OHCI1394_PhyControl                   0x0EC
+#define OHCI1394_PhyControl                   0x0EC	/* SCLK domain */
 #define   OHCI1394_PhyControl_Read(addr)	(((addr) << 8) | 0x00008000)
 #define   OHCI1394_PhyControl_ReadDone		0x80000000
 #define   OHCI1394_PhyControl_ReadData(r)	(((r) & 0x00ff0000) >> 16)
 #define   OHCI1394_PhyControl_Write(addr, data)	(((addr) << 8) | (data) | 0x00004000)
 #define   OHCI1394_PhyControl_WritePending	0x00004000
-#define OHCI1394_IsochronousCycleTimer        0x0F0
-#define OHCI1394_AsReqFilterHiSet             0x100
-#define OHCI1394_AsReqFilterHiClear           0x104
-#define OHCI1394_AsReqFilterLoSet             0x108
-#define OHCI1394_AsReqFilterLoClear           0x10C
-#define OHCI1394_PhyReqFilterHiSet            0x110
-#define OHCI1394_PhyReqFilterHiClear          0x114
-#define OHCI1394_PhyReqFilterLoSet            0x118
-#define OHCI1394_PhyReqFilterLoClear          0x11C
+#define OHCI1394_IsochronousCycleTimer        0x0F0	/* SCLK domain */
+#define OHCI1394_AsReqFilterHiSet             0x100	/* SCLK domain */
+#define OHCI1394_AsReqFilterHiClear           0x104	/* SCLK domain */
+#define OHCI1394_AsReqFilterLoSet             0x108	/* SCLK domain */
+#define OHCI1394_AsReqFilterLoClear           0x10C	/* SCLK domain */
+#define OHCI1394_PhyReqFilterHiSet            0x110	/* SCLK domain */
+#define OHCI1394_PhyReqFilterHiClear          0x114	/* SCLK domain */
+#define OHCI1394_PhyReqFilterLoSet            0x118	/* SCLK domain */
+#define OHCI1394_PhyReqFilterLoClear          0x11C	/* SCLK domain */
 #define OHCI1394_PhyUpperBound                0x120
 
 #define OHCI1394_AsReqTrContextBase           0x180
@@ -108,8 +109,8 @@
 
 /* Isochronous receive registers */
 #define OHCI1394_IsoRcvContextBase(n)         (0x400 + 32 * (n))
-#define OHCI1394_IsoRcvContextControlSet(n)   (0x400 + 32 * (n))
-#define OHCI1394_IsoRcvContextControlClear(n) (0x404 + 32 * (n))
+#define OHCI1394_IsoRcvContextControlSet(n)   (0x400 + 32 * (n)) /* SCLK domain */
+#define OHCI1394_IsoRcvContextControlClear(n) (0x404 + 32 * (n)) /* SCLK domain */
 #define OHCI1394_IsoRcvCommandPtr(n)          (0x40C + 32 * (n))
 #define OHCI1394_IsoRcvContextMatch(n)        (0x410 + 32 * (n))
 
