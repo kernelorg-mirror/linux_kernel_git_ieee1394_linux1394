@@ -273,12 +273,13 @@ static char ohci_driver_name[] = KBUILD_MODNAME;
 #define PCI_DEVICE_ID_TI_TSB82AA2	0x8025
 #define PCI_VENDOR_ID_PINNACLE_SYSTEMS	0x11bd
 
-#define QUIRK_CYCLE_TIMER		1
-#define QUIRK_RESET_PACKET		2
-#define QUIRK_BE_HEADERS		4
-#define QUIRK_NO_1394A			8
-#define QUIRK_NO_MSI			16
-#define QUIRK_TI_SLLZ059		32
+#define QUIRK_CYCLE_TIMER		0x01
+#define QUIRK_RESET_PACKET		0x02
+#define QUIRK_BE_HEADERS		0x04
+#define QUIRK_NO_1394A			0x08
+#define QUIRK_NO_MSI			0x10
+#define QUIRK_TI_SLLZ059		0x20
+#define QUIRK_REG_ACCESS_FAIL		0x40
 
 /* In case of multiple matches in ohci_quirks[], only the first one is used. */
 static const struct {
@@ -334,6 +335,7 @@ MODULE_PARM_DESC(quirks, "Chip quirks (default = 0"
 	", no 1394a enhancements = "	__stringify(QUIRK_NO_1394A)
 	", disable MSI = "		__stringify(QUIRK_NO_MSI)
 	", TI SLLZ059 erratum = "	__stringify(QUIRK_TI_SLLZ059)
+	", check regAccessFail = "	__stringify(QUIRK_REG_ACCESS_FAIL)
 	")");
 
 #define OHCI_PARAM_DEBUG_AT_AR		1
@@ -540,8 +542,12 @@ static inline void flush_writes(const struct fw_ohci *ohci)
 /* caller must hold sclk_domain_reg_lock */
 static int check_reg_access_fail(const struct fw_ohci *ohci)
 {
-	u32 reg = reg_read(ohci, OHCI1394_IntEventSet);
+	u32 reg;
 
+	if (!(ohci->quirks & QUIRK_REG_ACCESS_FAIL))
+		return 0;
+
+	reg = reg_read(ohci, OHCI1394_IntEventSet);
 	if (!~reg)
 		return -ENODEV; /* Card was ejected. */
 
@@ -577,18 +583,30 @@ static int reg_rw_sclk(struct fw_ohci *ohci, int offset, u32 *data, bool read)
 
 static int reg_read_sclk(struct fw_ohci *ohci, int offset, u32 *data)
 {
-	return reg_rw_sclk(ohci, offset, data, true);
+	if (ohci->quirks & QUIRK_REG_ACCESS_FAIL)
+		return reg_rw_sclk(ohci, offset, data, true);
+
+	*data = reg_read(ohci, offset);
+	return 0;
 }
 
 static int reg_write_sclk(struct fw_ohci *ohci, int offset, u32 data)
 {
-	return reg_rw_sclk(ohci, offset, &data, false);
+	if (ohci->quirks & QUIRK_REG_ACCESS_FAIL)
+		return reg_rw_sclk(ohci, offset, &data, false);
+
+	reg_write(ohci, offset, data);
+	return 0;
 }
 
 static int reg_write_sclk_flush(struct fw_ohci *ohci, int offset, u32 data)
 {
-	/* Just for documentation. reg_rw_sclk() already flushes MMIO. */
-	return reg_rw_sclk(ohci, offset, &data, false);
+	if (ohci->quirks & QUIRK_REG_ACCESS_FAIL)
+		return reg_rw_sclk(ohci, offset, &data, false);
+
+	reg_write(ohci, offset, data);
+	flush_writes(ohci);
+	return 0;
 }
 
 /*
@@ -2365,7 +2383,12 @@ static int ohci_enable(struct fw_card *card,
 		dev_err(card->device, "failed to set Link Power Status\n");
 		return -EIO;
 	}
-	reg_write(ohci, OHCI1394_IntEventClear, OHCI1394_regAccessFail);
+
+	version = reg_read(ohci, OHCI1394_Version) & 0x00ff00ff;
+	if (version >= OHCI_VERSION_1_1) {
+		reg_write(ohci, OHCI1394_IntEventClear, OHCI1394_regAccessFail);
+		ohci->quirks |= QUIRK_REG_ACCESS_FAIL;
+	}
 
 	if (ohci->quirks & QUIRK_TI_SLLZ059) {
 		ret = probe_tsb41ba3d(ohci);
@@ -2395,7 +2418,6 @@ static int ohci_enable(struct fw_card *card,
 
 	ohci->bus_time_running = false;
 
-	version = reg_read(ohci, OHCI1394_Version) & 0x00ff00ff;
 	if (version >= OHCI_VERSION_1_1) {
 		reg_write(ohci, OHCI1394_InitialChannelsAvailableHi,
 			  0xfffffffe);
@@ -3036,7 +3058,7 @@ static int set_multichannel_mask(struct fw_ohci *ohci, u64 channels)
 	ret = check_reg_access_fail(ohci);
 	if (ret == 0)
 		ohci->mc_channels = channels;
-	/* Required mmiowb() is provided by check_reg_access_fail(). */
+	mmiowb();
 
 	spin_unlock_irqrestore(&ohci->sclk_domain_reg_lock, flags);
 
