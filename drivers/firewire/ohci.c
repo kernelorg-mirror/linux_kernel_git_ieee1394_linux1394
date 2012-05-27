@@ -265,6 +265,7 @@ static inline struct fw_ohci *fw_ohci(struct fw_card *card)
 
 static char ohci_driver_name[] = KBUILD_MODNAME;
 
+#define PCI_DEVICE_ID_AGERE_FW323	0x5811
 #define PCI_DEVICE_ID_AGERE_FW643	0x5901
 #define PCI_DEVICE_ID_CREATIVE_SB1394	0x4001
 #define PCI_DEVICE_ID_JMICRON_JMB38X_FW	0x2380
@@ -281,6 +282,9 @@ static char ohci_driver_name[] = KBUILD_MODNAME;
 #define QUIRK_TI_SLLZ059		0x20
 #define QUIRK_REG_ACCESS_FAIL		0x40
 
+/* OHCI 1.1 and 1.0 compatible link without intEvent.regAccessFail bit */
+#define NO_REG_ACCESS_FAIL		(1 << 15)
+
 /* In case of multiple matches in ohci_quirks[], only the first one is used. */
 static const struct {
 	unsigned short vendor, device, revision, flags;
@@ -291,8 +295,14 @@ static const struct {
 	{PCI_VENDOR_ID_APPLE, PCI_DEVICE_ID_APPLE_UNI_N_FW, PCI_ANY_ID,
 		QUIRK_BE_HEADERS},
 
+	{PCI_VENDOR_ID_ATT, PCI_DEVICE_ID_AGERE_FW323, PCI_ANY_ID,
+		NO_REG_ACCESS_FAIL},
+
 	{PCI_VENDOR_ID_ATT, PCI_DEVICE_ID_AGERE_FW643, 6,
-		QUIRK_NO_MSI},
+		QUIRK_NO_MSI | NO_REG_ACCESS_FAIL},
+
+	{PCI_VENDOR_ID_ATT, PCI_DEVICE_ID_AGERE_FW643, PCI_ANY_ID,
+		NO_REG_ACCESS_FAIL},
 
 	{PCI_VENDOR_ID_CREATIVE, PCI_DEVICE_ID_CREATIVE_SB1394, PCI_ANY_ID,
 		QUIRK_RESET_PACKET},
@@ -322,7 +332,7 @@ static const struct {
 		QUIRK_RESET_PACKET},
 
 	{PCI_VENDOR_ID_VIA, PCI_ANY_ID, PCI_ANY_ID,
-		QUIRK_CYCLE_TIMER | QUIRK_NO_MSI},
+		QUIRK_CYCLE_TIMER | QUIRK_NO_MSI | NO_REG_ACCESS_FAIL},
 };
 
 /* This overrides anything that was found in ohci_quirks[]. */
@@ -2385,7 +2395,8 @@ static int ohci_enable(struct fw_card *card,
 	}
 
 	version = reg_read(ohci, OHCI1394_Version) & 0x00ff00ff;
-	if (version >= OHCI_VERSION_1_1) {
+	if (version >= OHCI_VERSION_1_1 &&
+	    !(ohci->quirks & NO_REG_ACCESS_FAIL)) {
 		reg_write(ohci, OHCI1394_IntEventClear, OHCI1394_regAccessFail);
 		ohci->quirks |= QUIRK_REG_ACCESS_FAIL;
 	}
@@ -3837,7 +3848,7 @@ static int __devinit pci_probe(struct pci_dev *dev,
 		  "added OHCI v%x.%x device as card %d, "
 		  "%d IR + %d IT contexts, quirks 0x%x\n",
 		  version >> 16, version & 0xff, ohci->card.index,
-		  ohci->n_ir, ohci->n_it, ohci->quirks);
+		  ohci->n_ir, ohci->n_it, ohci->quirks & ~NO_REG_ACCESS_FAIL);
 
 	return 0;
 
